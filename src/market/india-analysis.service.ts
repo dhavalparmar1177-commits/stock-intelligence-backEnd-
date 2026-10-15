@@ -19,6 +19,7 @@ import {
 import {
   projectionEvents, milestoneEvents, UNAVAILABLE_TYPES, CALENDAR_CONTRACT,
 } from "./calendar";
+import { overviewCache, scanCache } from "./cache";
 
 const MIN_BARS = 60; // ~3 months of daily data required (covers SMA50/MACD/RSI/Bollinger); below this: "Insufficient data"
 const FULL_BARS = 120; // below this, confidence is reduced and the gap is disclosed
@@ -600,62 +601,65 @@ export const indiaAnalysisService = {
 
   // ---------- AI opportunity scanner: light scoring over the NSE universe ----------
   async scanOpportunities(limit = 8, lang: AiLang = "en") {
-    const L = STR[lang] ?? STR.en;
-    const seen = new Map<string, { app: string; yahoo: string; name: string }>();
-    for (const s of [...APP_SYMBOLS, ...MOVERS_UNIVERSE]) {
-      if ((s.exchange === "NSE" || s.exchange === "BSE") && !seen.has(s.yahoo)) seen.set(s.yahoo, { app: s.app, yahoo: s.yahoo, name: s.name });
-    }
-    const universe = [...seen.values()];
-    const nifty = await indexContext(providerSym(NIFTY), "NIFTY50").catch(() => null);
-    const mktPts = nifty ? (nifty.aboveSMA50 ? 8 : 0) + ((nifty.rsi14 ?? 50) >= 50 ? 7 : 0) : 0;
+    const cacheKey = `scan:${lang}:${limit}`;
+    return scanCache.getOrFetch(cacheKey, async () => {
+      const L = STR[lang] ?? STR.en;
+      const seen = new Map<string, { app: string; yahoo: string; name: string }>();
+      for (const s of [...APP_SYMBOLS, ...MOVERS_UNIVERSE]) {
+        if ((s.exchange === "NSE" || s.exchange === "BSE") && !seen.has(s.yahoo)) seen.set(s.yahoo, { app: s.app, yahoo: s.yahoo, name: s.name });
+      }
+      const universe = [...seen.values()];
+      const nifty = await indexContext(providerSym(NIFTY), "NIFTY50").catch(() => null);
+      const mktPts = nifty ? (nifty.aboveSMA50 ? 8 : 0) + ((nifty.rsi14 ?? 50) >= 50 ? 7 : 0) : 0;
 
-    const results: any[] = [];
-    for (let i = 0; i < universe.length; i += 5) {
-      const chunk = universe.slice(i, i + 5);
-      const out = await Promise.all(chunk.map(async (u) => {
-        try {
-          const [q, bars] = await Promise.all([
-            getProvider().getQuote(providerSym(u.yahoo)),
-            getProvider().getHistory(providerSym(u.yahoo), "1d", "6mo"),
-          ]);
-          const closes = bars.map((b) => b.close);
-          if (closes.length < 60) return null;
-          const s50 = sma(closes, 50), s200 = sma(closes, Math.min(200, closes.length));
-          const r = rsi(closes, 14), m = macd(closes);
-          const mom = closes.length > 63 ? ((closes[closes.length - 1] - closes[closes.length - 63]) / closes[closes.length - 63]) * 100 : null;
-          const v = volumeStats(bars.map((b) => b.volume), 20);
-          // Light score mirrors the full weights (technical 30 + momentum 15 + volume 10 + market 15), renormalized to 100.
-          let earned = 0, avail = 0;
-          let t = 0;
-          if (s50 !== null && s200 !== null) { t += q.price > s50 && s50 > s200 ? 12 : q.price > s50 || s50 > s200 ? 6 : 0; }
-          if (r !== null) t += r >= 50 && r <= 70 ? 8 : r > 70 ? 3 : r >= 40 ? 5 : 2;
-          if (m) t += m.hist > 0 ? 7 : 0;
-          earned += t; avail += 27; // SMA structure needs both SMAs; bb skipped in scan
-          if (mom !== null) { earned += mom > 10 ? 15 : mom > 0 ? 10 : mom > -5 ? 5 : 0; avail += 15; }
-          if (v) { earned += v.ratio >= 0.8 && v.ratio <= 2 ? 10 : v.ratio >= 0.5 || v.ratio <= 3 ? 7 : 4; avail += 10; }
-          if (nifty) { earned += mktPts; avail += 15; }
-          const score = avail > 0 ? Math.round((earned / avail) * 100) : 0;
-          const why: string[] = [];
-          if (s50 !== null && q.price > s50) why.push(L.whySMA(s50.toFixed(1)));
-          if (r !== null && r >= 50 && r <= 70) why.push(L.whyRSI(r.toFixed(1)));
-          if (m && m.hist > 0) why.push(L.whyMACD());
-          if (mom !== null && mom > 10) why.push(L.whyMom(mom.toFixed(1)));
-          if (v && v.ratio >= 2) why.push(L.whyVol(v.ratio.toFixed(1)));
-          const rawSignal = score >= 65 ? "BUY" : score >= 45 ? "HOLD" : "SELL";
-          return {
-            symbol: u.app, name: u.name, price: q.price, changePct: Number(q.changePct.toFixed(2)),
-            score, signal: L.signal(rawSignal as "BUY" | "HOLD" | "SELL"),
-            rsi14: r !== null ? Number(r.toFixed(1)) : null,
-            momentum3mPct: mom !== null ? Number(mom.toFixed(1)) : null,
-            volumeRatio: v ? Number(v.ratio.toFixed(2)) : null,
-            reasons: why.slice(0, 3),
-          };
-        } catch { return null; } // unscannable symbols are skipped, never fabricated
-      }));
-      for (const o of out) if (o) results.push(o);
-    }
-    results.sort((a, b) => b.score - a.score);
-    return { mode: "live" as const, market: "IN" as const, asOf: new Date().toISOString(), scanned: universe.length, ranked: results.length, opportunities: results.slice(0, Math.max(1, Math.min(10, limit))) };
+      const results: any[] = [];
+      for (let i = 0; i < universe.length; i += 5) {
+        const chunk = universe.slice(i, i + 5);
+        const out = await Promise.all(chunk.map(async (u) => {
+          try {
+            const [q, bars] = await Promise.all([
+              getProvider().getQuote(providerSym(u.yahoo)),
+              getProvider().getHistory(providerSym(u.yahoo), "1d", "6mo"),
+            ]);
+            const closes = bars.map((b) => b.close);
+            if (closes.length < 60) return null;
+            const s50 = sma(closes, 50), s200 = sma(closes, Math.min(200, closes.length));
+            const r = rsi(closes, 14), m = macd(closes);
+            const mom = closes.length > 63 ? ((closes[closes.length - 1] - closes[closes.length - 63]) / closes[closes.length - 63]) * 100 : null;
+            const v = volumeStats(bars.map((b) => b.volume), 20);
+            // Light score mirrors the full weights (technical 30 + momentum 15 + volume 10 + market 15), renormalized to 100.
+            let earned = 0, avail = 0;
+            let t = 0;
+            if (s50 !== null && s200 !== null) { t += q.price > s50 && s50 > s200 ? 12 : q.price > s50 || s50 > s200 ? 6 : 0; }
+            if (r !== null) t += r >= 50 && r <= 70 ? 8 : r > 70 ? 3 : r >= 40 ? 5 : 2;
+            if (m) t += m.hist > 0 ? 7 : 0;
+            earned += t; avail += 27; // SMA structure needs both SMAs; bb skipped in scan
+            if (mom !== null) { earned += mom > 10 ? 15 : mom > 0 ? 10 : mom > -5 ? 5 : 0; avail += 15; }
+            if (v) { earned += v.ratio >= 0.8 && v.ratio <= 2 ? 10 : v.ratio >= 0.5 || v.ratio <= 3 ? 7 : 4; avail += 10; }
+            if (nifty) { earned += mktPts; avail += 15; }
+            const score = avail > 0 ? Math.round((earned / avail) * 100) : 0;
+            const why: string[] = [];
+            if (s50 !== null && q.price > s50) why.push(L.whySMA(s50.toFixed(1)));
+            if (r !== null && r >= 50 && r <= 70) why.push(L.whyRSI(r.toFixed(1)));
+            if (m && m.hist > 0) why.push(L.whyMACD());
+            if (mom !== null && mom > 10) why.push(L.whyMom(mom.toFixed(1)));
+            if (v && v.ratio >= 2) why.push(L.whyVol(v.ratio.toFixed(1)));
+            const rawSignal = score >= 65 ? "BUY" : score >= 45 ? "HOLD" : "SELL";
+            return {
+              symbol: u.app, name: u.name, price: q.price, changePct: Number(q.changePct.toFixed(2)),
+              score, signal: L.signal(rawSignal as "BUY" | "HOLD" | "SELL"),
+              rsi14: r !== null ? Number(r.toFixed(1)) : null,
+              momentum3mPct: mom !== null ? Number(mom.toFixed(1)) : null,
+              volumeRatio: v ? Number(v.ratio.toFixed(2)) : null,
+              reasons: why.slice(0, 3),
+            };
+          } catch { return null; } // unscannable symbols are skipped, never fabricated
+        }));
+        for (const o of out) if (o) results.push(o);
+      }
+      results.sort((a, b) => b.score - a.score);
+      return { mode: "live" as const, market: "IN" as const, asOf: new Date().toISOString(), scanned: universe.length, ranked: results.length, opportunities: results.slice(0, Math.max(1, Math.min(10, limit))) };
+    });
   },
 
   // ---------- AI comparison of 2-5 Indian stocks ----------
@@ -682,31 +686,34 @@ export const indiaAnalysisService = {
 
   // ---------- Indian market & sector overview ----------
   async marketOverview(lang: AiLang = "en") {
-    const L = STR[lang] ?? STR.en;
-    const [nifty, sensex, adv] = await Promise.all([
-      indexContext(providerSym(NIFTY), "NIFTY50").catch(() => null),
-      indexContext(sensexTicker(), "SENSEX").catch(() => null),
-      breadth().catch(() => null),
-    ]);
-    const sectorIdx = new Map<string, { sector: string; index: string; indexName: string }>();
-    for (const k of Object.keys(SECTOR_INDEX)) {
-      const s = SECTOR_INDEX[k];
-      if (s.index !== NIFTY && !sectorIdx.has(s.index)) sectorIdx.set(s.index, s);
-    }
-    const sectors = await Promise.all([...sectorIdx.values()].map(async (s) => {
-      try {
-        const [q, bars] = await Promise.all([getProvider().getQuote(providerSym(s.index)), getProvider().getHistory(providerSym(s.index), "1d", "6mo")]);
-        const closes = bars.map((b) => b.close);
-        const s50 = sma(closes, 50);
-        const mom = closes.length > 63 ? ((closes[closes.length - 1] - closes[closes.length - 63]) / closes[closes.length - 63]) * 100 : null;
-        return { sector: s.sector, index: s.indexName, price: q.price, changePct: Number(q.changePct.toFixed(2)), aboveSMA50: s50 !== null ? q.price > s50 : null, momentum3mPct: mom !== null ? Number(mom.toFixed(1)) : null };
-      } catch { return { sector: s.sector, index: s.indexName, unavailable: true as const }; }
-    }));
-    const rawRegime = !nifty ? "Unknown" : nifty.aboveSMA50 && (nifty.rsi14 ?? 50) >= 50 ? "Bullish" : !nifty.aboveSMA50 && (nifty.rsi14 ?? 50) < 45 ? "Bearish" : "Neutral";
-    return {
-      mode: "live" as const, market: "IN" as const, asOf: new Date().toISOString(),
-      regime: L.regime(rawRegime), nifty, sensex, breadth: adv, sectors,
-    };
+    const cacheKey = `overview:${lang}`;
+    return overviewCache.getOrFetch(cacheKey, async () => {
+      const L = STR[lang] ?? STR.en;
+      const [nifty, sensex, adv] = await Promise.all([
+        indexContext(providerSym(NIFTY), "NIFTY50").catch(() => null),
+        indexContext(sensexTicker(), "SENSEX").catch(() => null),
+        breadth().catch(() => null),
+      ]);
+      const sectorIdx = new Map<string, { sector: string; index: string; indexName: string }>();
+      for (const k of Object.keys(SECTOR_INDEX)) {
+        const s = SECTOR_INDEX[k];
+        if (s.index !== NIFTY && !sectorIdx.has(s.index)) sectorIdx.set(s.index, s);
+      }
+      const sectors = await Promise.all([...sectorIdx.values()].map(async (s) => {
+        try {
+          const [q, bars] = await Promise.all([getProvider().getQuote(providerSym(s.index)), getProvider().getHistory(providerSym(s.index), "1d", "6mo")]);
+          const closes = bars.map((b) => b.close);
+          const s50 = sma(closes, 50);
+          const mom = closes.length > 63 ? ((closes[closes.length - 1] - closes[closes.length - 63]) / closes[closes.length - 63]) * 100 : null;
+          return { sector: s.sector, index: s.indexName, price: q.price, changePct: Number(q.changePct.toFixed(2)), aboveSMA50: s50 !== null ? q.price > s50 : null, momentum3mPct: mom !== null ? Number(mom.toFixed(1)) : null };
+        } catch { return { sector: s.sector, index: s.indexName, unavailable: true as const }; }
+      }));
+      const rawRegime = !nifty ? "Unknown" : nifty.aboveSMA50 && (nifty.rsi14 ?? 50) >= 50 ? "Bullish" : !nifty.aboveSMA50 && (nifty.rsi14 ?? 50) < 45 ? "Bearish" : "Neutral";
+      return {
+        mode: "live" as const, market: "IN" as const, asOf: new Date().toISOString(),
+        regime: L.regime(rawRegime), nifty, sensex, breadth: adv, sectors,
+      };
+    });
   },
 
   // ---------- sector constituents: all stocks per sector with live data ----------
